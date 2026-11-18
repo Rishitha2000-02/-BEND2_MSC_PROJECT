@@ -1,0 +1,69 @@
+BEND2 PART B - EXECUTION MODEL AND PARALLELISM
+
+1. EXECUTION MODEL
+Bend2 uses a flat evaluator instead of a conventional C call stack.
+The compiler generates one C file that can execute on CPU and GPU.
+
+2. PARALLELISM
+Parallelism is expressed through parallel function calls.
+The runtime uses a binary fork-join scheduling model.
+
+3. TASK CUBE
+BendRT organises tasks in a 128 x 128 grid of rings.
+It uses two phases:
+- Grow phase: creates and distributes tasks.
+- Work phase: executes tasks and completes joins.
+
+4. SCHEDULER
+The CPU pool supports up to 128 threads.
+The scheduler avoids shared queues, locks, task migration and work stealing.
+The programmer must provide balanced workloads.
+
+5. MEMORY MANAGEMENT
+Terms are represented using 64-bit words.
+BendRT uses affine ownership and counted sharing.
+It does not use a tracing garbage collector.
+Memory is released through Take and Drop operations.
+
+6. GPU EXECUTION
+BendRT supports Metal and CUDA.
+The same functions can execute on CPU and GPU.
+GPU execution requires suitable hardware and device support.
+CPU and GPU do not compute simultaneously.
+
+7. HVM COMPARISON
+Historical HVM uses interaction-net reduction.
+BendRT uses affine ownership, a flat evaluator and a task-cube scheduler.
+BendRT trades optimal shared-redex reduction for a simpler native execution model.
+
+8. PRACTICAL EXPERIMENT
+Workload: pow2(20)
+Expected result: 1048576
+Hardware: Intel Core i5-1235U, 6 available CPUs
+GPU: VMware SVGA II Adapter
+CUDA: Not installed
+
+One thread median: 9.1852 ms
+Six threads median: 5.7759 ms
+Measured speedup: 1.59x
+Performance improvement: approximately 37.1%.
+
+9. PUBLISHED PAPER RESULTS
+The BendRT paper reports 8.8 to 12.1 times speedup
+using 16 threads on an Apple M4 Max.
+Its GPU measurements use Apple's Metal backend.
+The paper reports up to 67 times speedup for selected uniform workloads.
+
+10. LIMITATIONS
+- Parallel workloads must be balanced.
+- No work stealing or runtime rebalancing.
+- CPU and GPU do not compute simultaneously.
+- GPU calls require suitable sequential execution points.
+- CUDA benchmark results are not reported in the paper.
+- The C runtime is not formally verified.
+
+CONCLUSION
+Bend2 combines an affine type system, flat evaluator and
+fork-join scheduler to support CPU and GPU parallel execution.
+The practical experiment demonstrated a 1.59x speedup
+with six CPU workers for the selected recursive workload.

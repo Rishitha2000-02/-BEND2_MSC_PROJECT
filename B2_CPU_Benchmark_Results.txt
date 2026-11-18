@@ -1,0 +1,45 @@
+BEND2 PART B - CPU PARALLELISM BENCHMARK
+
+Experiment:
+Calculation of pow2(20) using Bend2 parallel recursion.
+
+Expected result:
+1048576
+
+Hardware:
+CPU: 12th Gen Intel Core i5-1235U
+Available CPUs: 6
+GPU: VMware SVGA II Adapter
+CUDA: Not installed
+
+GPU execution:
+Disabled using --gpu off.
+
+Benchmark configuration:
+1 worker thread versus 6 worker threads.
+20 measured runs per configuration.
+Median execution time calculated using Python time.perf_counter().
+
+Results:
+1 thread:
+Median execution time = 9.1852 ms
+
+6 threads:
+Median execution time = 5.7759 ms
+
+Speedup:
+9.1852 / 5.7759 = 1.59x
+
+Performance improvement:
+Approximately 37.1%.
+
+Observations:
+1. Both configurations produced the correct result (1048576).
+2. Six worker threads were faster than one worker thread.
+3. The measured speedup was 1.59x, not linear scaling.
+4. GPU execution was not tested because CUDA was unavailable.
+5. Results are specific to this workload and virtual-machine environment.
+
+Conclusion:
+The experiment demonstrates that Bend2's CPU runtime can benefit
+from multiple worker threads for this parallel recursive workload.

@@ -1,0 +1,375 @@
+                BendRT: A Parallel Runtime for CPUs and GPUs
+                                    Victor Taelin, Lorenzo W Battistela, Paulo J Cavalcanti
+                                    Nicolas Abril, Vitor Chiarelli Neves, Vanessa Ostroski
+                                                          Higher Order Company
+                                                           Rio de Janeiro, Brazil
+                                                        taelin@higherorderco.com
+
+ AI Disclosure. Bend and BendRT were designed by the human author. This paper was written by Claude Fable 5.1 from the author’s code and design
+ notes, and reviewed by the author. Human paper soon™.
+
+
+Abstract                                                                    We follow one program from source to C, to tasks, to the
+                                                                          GPU dispatch that runs it. Readers of the author’s earlier
+BendRT is the runtime of Bend, a pure functional language
+                                                                          runtimes may expect interaction nets [7, 13] here; there are
+with an affine dependent type system. The compiler emits
+                                                                          none (Section 11).
+one C file per program; that file runs the same code on
+one thread, on CPU threads, and on the GPU through
+Metal or CUDA, over one heap, with no garbage collector                   2 The Program and Its Contract
+and no user-written kernels. Three ideas carry the design.
+                                                                            import Base
+Affinity comes from the checker: a value has one owner,
+so a match frees the node it consumed, a forked task owns                   type Tree is Type:
+its arguments, and sharing exists only where the compiler                     Leaf{x: U32}
+placed a counted share or a borrow. The evaluator is flat:                    Node{l: Tree, r: Tree}
+every function is a case tree inside one worklist function
+                                                                            def build(+d: Nat, +i: U32) -> Tree:
+with no C call stack, and every call site reads two ways,                     match d:
+sequential and parallel, so one text serves every executor.                     case 0n:
+Tasks live in a cube, a 128 by 128 grid of rings that forks                       Leaf{i}
+along its rows in a grow phase and drains along its columns                     case 1n+p:
+                                                                                  l r = build(p, (i * 2 : U32)) build(p, (i *
+in a work phase, with no shared queue, no lock and no
+                                                                            2 + 1 : U32))
+work stealing. The price is a contract: the program’s forks                       Node{l, r}
+must split their work evenly. On an Apple M4 Max (pin of
+2026-08-31) the sequential build runs within 0.8 to 1.5 times               def sum(t: Tree) -> U32:
+the time of hand-written C, sixteen threads give 9 to 12 times                match t:
+                                                                                case Leaf{x}:
+over one, and the integrated GPU up to 67 times.                                  x
+                                                                                case Node{l, r}:
+1 Introduction                                                                    a b = sum(l) sum(r)
+                                                                                  (a + b : U32)
+Bend’s type system, developed in a companion paper [12], is
+affine: a live value is consumed at most once unless its binder             def main() -> IO(Unit):
+                                                                              t = build(20n, 0)
+is marked + , and a + binder forms only at the kind Data ,                    IO.print(U32.show(sum!(t)))
+which excludes functions, arrays and handles. The theory
+paper argues that this wall makes the language consistent.                The program builds a tree of 220 leaves and sums it. Two
+This paper argues that it also makes the language fast. The               marks carry all the parallelism Bend has. The parallel let
+costs that runtimes for functional languages pay most for                  l r = f(x) g(y) binds 𝑛 names to 𝑛 calls in one statement
+
+all come from not knowing who owns a value, and affinity                  and means: run these calls in parallel; they split the work
+settles ownership at compile time. Other runtimes need a                  into roughly equal parts. The mark sum!(t) means: run
+garbage collector because nobody knows when a value’s last                this call on the GPU. Nothing else creates parallelism, and
+owner leaves; in Bend the one owner is the match that con­                the runtime trusts the equal-parts promise absolutely (Sec­
+sumes it, so deallocation is compiled code. They need work                tion 6).
+stealing because tasks are cheap to make and hard to place;                  The checker hands the compiler more than types. A match
+in Bend a task owns its arguments, so a fork moves memory                 consumes its scrutinee, always a parameter or a field of one,
+and never shares it, and the only cross-thread protocol is                never a computed value. A def body is flattened at parse into
+delivering an answer into a join. They stay off the GPU,                  a case tree, lambdas and constructor matches over leaves,
+which wants flat memory, no recursion and no runtime;                     and validation annotates every node with its type; erased
+Bend’s evaluator needs no collector, and with one discipline              binders ( - ), types and proofs never reach the emitted code.
+on calls no C stack either, so the C file is also the shader.
+2                                                                                                                 Victor Taelin et al.
+
+
+One law governs what follows: a compiler may drop a copy
+                                                                      WL_CASE(FID_SUM) {
+the source spelled, never add one.                                      Term t = r0;
+                                                                        WL_SPIN
+                                                                        if (term_aux(t) == CID_LEAF) {
+3 Compilation                                                             WL_RET(term_loc(t)); // packed: no node
+                                                                        } else {
+3.1 Tail, Cut, Fork                                                       u64 nd = term_loc(t);
+The runtime has no C call stack for user code, so every call              Term l = e.mem[nd + 0];
+must sit where a jump can replace it. The first pass rewrites             Term r = e.mem[nd + 1];
+                                                                          heap_free(e, cls_fit(2), nd); // owned
+each reachable body until every call has one of three shapes              if (!seq) { // parallel: a join, two kids
+and all else is call-free expression code. A tail is a saturated            u64 j = task_node(e, FID_SUM_J,
+call in return position. A cut is one call whose result is                    WL_CONT, WL_IDX, 2);
+named; its continuation is minted as a sequential definition                Term jt = term_tsk(FID_SUM_J, j);
+                                                                            u64 k0 = task_node(e, FID_SUM, jt, 0, 0);
+ f$k . A fork is a let of two or more calls; its continuation
+                                                                            e.mem[k0] = l; WL_KID(j, 0, FID_SUM, k0);
+is minted as a joiner f$j . Lambdas lift into definitions f$c               u64 k1 = task_node(e, FID_SUM, jt, 1, 0);
+over their captures, so a closure is a definition applied to all            e.mem[k1] = r; WL_KID(j, 1, FID_SUM, k1);
+but one of its arguments.                                                   return jt;
+                                                                          }
+   Two whole-program analyses then decide the memory
+                                                                          STK(0) = r; STK(1) = FID_SUM_S_1;
+traffic. Share inference finds the constructor types that wear            WL_PUSHN(2);
+reference counts: a type is hot when some binder of it is used            t = l; WL_AGAIN; // sequential: in place
+more than once, when a hot type’s live field reaches it, or             }
+when it is boxed in an array; everything else is built and              WL_SPUN
+                                                                      }
+consumed through plain stores and loads. Borrow inference             WL_CASE(FID_SUM_S_1) { // after sum(l)
+finds the arguments a callee only reads: each live argument             Term r = STK(-1);
+of a datatype starts borrowed and flips to owned on any                 STK(0) = r0; STK(1) = FID_SUM_S_0;
+escape, to a fixpoint. A borrowed argument is lent raw and              WL_PUSHN(2);
+                                                                        r0 = r; WL_JMP(FID_SUM);
+read in place, so a fold over a reused tree costs no count
+                                                                      }
+traffic. A small fork-free callee is inlined by running the           WL_CASE(FID_SUM_S_0) { // after sum(r)
+checker’s own evaluator on the call.                                    WL_POPN(2);
+                                                                        r1 = r0; r0 = STK(1);
+3.2 The Segment                                                         WL_JMP(FID_SUM_J);
+                                                                      }
+Each definition becomes one segment of the worklist func­             WL_CASE(FID_SUM_J) {
+tion. Listing 1 shows what the emitter prints for sum .                 WL_RET(U32_BIN(r0, +, r1));
+   Three things happen here. The match takes ownership:               }
+ Tree is not hot, so the arm reads both fields and frees the
+node with two stores onto a free list. A Leaf never touched        Listing 1. The segments of sum , locals renamed and unboxing
+memory: a constructor with one word-sized field is packed          elided.
+into the term word. And the fork is read twice. In the parallel
+world the arm mints a join task with one empty slot per            array) point at a node. HOLE , all ones, marks an undelivered
+child, spawns each child pointing back at its slot, and returns    task slot.
+the join as its reply for the scheduler to deal out (Section 6).      Every executor shares one flat array of words, the corpus:
+In the sequential world it pushes a frame and runs the first       a header, the 214 task rings of Section 6, the lane stacks, and
+call in place; each step pushes the next frame, and the last       the heap. The host maps 8 GB and doubles it in place as
+jumps into the joiner with both results in the bank.               the heap fills, up to 8 TB, with pages faulting in on touch;
+   The emitted file is the runtime template, the program’s         the GPU fixes its span before the first dispatch (Section 7).
+tables and segments, and the C source of every effect it           Both processors address the same words. Each lane allocates
+imports; --threads and --gpu pick the executor at run time.        from its own free lists and claims fresh pages off one global
+                                                                   counter, so an allocation is a pop or a bump, a free is two
+                                                                   stores, and neither crosses a thread.
+4 Memory
+                                                                   4.2 Ownership at Run Time
+4.1 Terms and the Corpus
+                                                                   Generated code moves values. Three operations cover the
+A term is one 64-bit word: a tag, a 16-bit aux (constructor        cases where it cannot. Take consumes a value at a match:
+or segment id) and a 40-bit heap location. A machine word,         read the fields, free the node. Keep gives a value a second
+a Nat below 248 and a constructor with at most one word-           owner and is emitted exactly at a binder’s second use: the
+sized field are packed into the word itself and never touch        first keep mints a redirect, one word holding the node’s
+the heap; a constructor, a closure, a task, and a flat block (an   address and a count, and turns the local into a pointer at
+                                                                   it; the count lives there, never on the node. Drop releases
+BendRT: A Parallel Runtime for CPUs and GPUs                                                                                       3
+
+
+an owner: a packed term costs nothing, a counted pointer                            ring 0 t0      t4    t8
+decrements and only the last one collects, a sole owner col­                        ring 1 t1      t5    t9
+lects at once. Take respects sharing: at count one it collapses
+                                                                                    ring 2 t2      t6     w
+the redirect and owns the node; above one it copies the fields
+                                                                                    ring 3 t3      t7
+out and releases its pointer. Every decrement is a release and
+whoever sees zero acquires first, so a field read never races a   Figure 1. The cube, shown 4 lanes wide. Tasks pushed along a row
+free. Only hot types pay any of this, but they pay it on every    during one phase are drained down the columns of the next: the flip
+node, shared or not: each stored field is sealed with a count     swaps the index map, an 𝑂(1) transposition that moves no task. A
+at build time.                                                    task born during a work pass ( w , darker) lands past the snapshot
+   Drop is the runtime’s only collector: an iterative walk that   and belongs to the next round.
+threads its worklist through the nodes being freed, so it allo­
+cates nothing and runs from any code on either processor.         6 The Task Cube
+There is no tracing, no epoch and no deep copy anywhere: a
+                                                                  6.1 Tasks are Terms
+ + variable is emitted at every use, and each extra use is the
+share or the borrow the compiler placed.                          A task is a heap term like any other: a node of arity plus two
+                                                                  words, [args..., cont, idx|rem] , tagged with the segment to
+4.3 Arrays                                                        enter. A join’s argument slots hold HOLE until its children
+In the source, Array<T> is a perfect binary tree walked by        answer; cont is the parent continuation task, or HOLE at
+index bits. The backends run it as one flat block: packed 32-     the root; idx says which slot of the parent this task’s own
+bit cells for an array of machine words, one owned term           answer fills, and rem how many children still owe one.
+per word otherwise. A read is an indexed load, a write an         Delivery writes the slot and decrements rem with release
+indexed store, and a read of a boxed cell shares it. Affinity     order; the lane that takes it to zero owns the runnable join
+makes the store sound: Array<T> is Type , never Data , so an      and runs it. Children of one join write disjoint slots and race
+array has one owner, nobody can observe the mutation, and         only on the countdown. A HOLE continuation is the root: its
+a copy is explicit. A match on the tree copies each half into     delivery is the program’s answer.
+its own block, and a node copies both back: a walk to the
+                                                                  6.2 The Cube
+leaves copies 𝑂(𝑛 log 𝑛) words. Get, set and swap open no
+half.                                                             The frontier lives in the cube: 214 rings arranged as a 128
+                                                                  by 128 square, one ring per lane, on the CPU and Metal.
+                                                                  CUDA sizes the cube to its L2, one group of 128 lanes per
+5 The Machine                                                     64 KB, from 128 by 16 to 128 by 128, and deepens each ring
+On the host every segment is a preserve_none function of          to match, so a cube always holds 221 slots. A single thread
+the machine’s words, entered by a musttail call (a dynamic        serves the whole square when parallelism is off. A ring is
+jump goes through a table of them); on the device the             a fixed FIFO of 1024 slots (up to 8192 on CUDA) with one
+segments are the cases of one switch inside an error-polling      producer step, a fetch-add and two stores, and one consumer
+loop. The state is a bank of words r0..rn (a segment’s para­      per phase, the lane that owns it. The square is stored slot-
+meters, or the results it receives), the current segment id, a    major, so a row and a column are both 𝑂(1) index maps,
+value stack, and the world flag seq .                             and flipping the cube, turning the rows one phase filled into
+   The function takes one task. Its prologue pushes the           the columns the next phase drains, swaps the indexer and
+task’s continuation, slot index and the exit segment onto         moves no task (Figure 1).
+the value stack, loads the arguments into the bank, frees the
+task node, and jumps. A segment ends in one of four ways.         6.3 Grow and Work
+A tail call loads the bank and jumps; a self call reloads its     The driver reads one number per round, the frontier 𝑓: how
+own parameters and loops. A cut, in the sequential world,         many tasks were pushed into the cube during the last round.
+pushes a frame holding the continuation’s captures and            While 𝑓 < 214 it runs a grow phase; it always runs a work
+segment id and jumps to the callee; in the parallel world it      phase; it stops when the root has delivered.
+mints a continuation task expecting one result, makes it the         Grow widens the frontier one fork step at a time. Each of
+current continuation, and jumps. A fork was shown above.          the 128 rows is served by one worker, a thread on the host or
+A return puts the value in the bank and pops the stack: the       a threadgroup on the device. It pops the head of each ring in
+popped word is the segment to enter next, a step or a minted      its row, runs it in the parallel world, and pushes what comes
+continuation, which reads its captures from the stack and its     back into the row: a fork reply deals its children round-robin
+result from the bank. The exit segment pops the task’s con­       across the row’s rings, and a runnable reply, a completed
+tinuation and delivers the bank into it; a marked call in the     continuation or a spawned marked call, is pushed back
+parallel world returns a spawned task instead of jumping.         whole. Tasks whose segment can never fork are skipped:
+   Recursion depth is bounded by the value stack alone: a         they cannot widen the frontier, and they wait for work. A
+guarded 2 GB mapping per host worker, a fixed window per          row stops growing when every ring in it has work or a sweep
+device lane, and the same numbered error on overflow.             grew nothing.
+4                                                                                                                 Victor Taelin et al.
+
+
+   Work runs at saturation. Every lane drains its column           failing lane compare-and-swaps its error into the header
+ring, down to a snapshot of the put counter taken at the           word, every long loop polls that word and drains, and the
+turn’s start, in the sequential world: forks run as consecu­       host reads it after the dispatch, prints one line and exits.
+tive calls on the value stack and cuts as frames, and most            The mark f!(x) is honored by the event loop (Section 8)
+of a program’s time is spent here, in straight-line code. A        at a sequential program point, where nothing else runs. The
+join completed by the lane’s last delivery runs at once, in        solo thread detaches the marked call whole, makes its con­
+the parallel world, so the forks it meets are dealt into the       tinuation the root, seeds it into ring zero and runs the phase
+cube through the global cursor and counted toward the next         loop on the device until the root delivers; then it hands the
+round’s frontier. This is the bulk-synchronous rhythm [16]:        answer into the original continuation and continues on the
+bursts of exponential fork, then deep sequential focus, then       CPU. Met anywhere else the mark degrades: in the parallel
+the next wave.                                                     world it spawns a task rather than nesting, in the sequential
+   The host pool is up to 128 threads, which claim rows by         world it is inert, and without a device it is inert everywhere.
+one fetch-add and meet at one barrier per turn; it opens at        The CPU and the GPU never compute at the same time.
+a program’s first fork. The GPU runs a grow as a dispatch          Floats follow one semantics on every executor (contraction
+of 128 groups (seeded by one group while 𝑓 < 128) and a            off, safe math on the device), and the harness checks that all
+work as one thread per lane; between dispatches the host           three print the same bytes.
+only reads 𝑓. After a grow from 𝑓 < 128, a lane drains its
+row ring, not its column, down to the put the grow left: a         8 Effects
+SIMD group then runs one root’s cousins, and a late group
+                                                                    IO(A) is a definition of the base library, not a primitive: a
+leaves new deals to the next round. From more roots a row
+holds unrelated deals, and the column keeps a fork’s kids          continuation over one datatype IO.OP with three construc­
+together.                                                          tors, Emit , Halt and Exit . A foreign fill, a def whose body
+                                                                   is import lines naming a .c and a .js file, compiles to one
+6.4 Why Nothing Contends                                           segment that packs its arguments and its continuation into
+Count what crosses a lane. A push is one fetch-add and two         a request. The event loop runs on one thread: it evaluates
+stores. A delivery is one release fetch-sub on the join’s own       main to a request through the pure machine, runs the effect’s
+
+node. A page claim is one fetch-add on the global cursor,          C handler, applies the continuation to the answer, and eval­
+once per quantum. That is all: no shared deque, no lock on         uates again; Emit ends the program, Halt prints its message
+the task path, no migration, no rebalance, and no task is ever     and exits with its code, and Exit exits with its code silently.
+re-read to be placed elsewhere. Every phase is a closed step,      A code outside 0..255 exits with 1 and an error. Effects never
+which is what lets the same phase bodies run as persistent         run inside an evaluator, and the machine performs no IO.
+host threads and as device dispatches.                             A fallible operation answers a Result carrying errno, and
+   The price is written into the language. Work stealing [2,       a handle threads back outside the Result , so even a failure
+4] repairs an unequal split at run time; the cube does not. If a   cannot lose it.
+program forks unequal parts, lanes idle at the end of a work
+turn, and the runtime declines to correct that: balance is the     9 The JavaScript Backend
+program’s job. The idioms are teachable: fork equal halves
+                                                                   The same rewritten definitions (Section 3) print as plain
+of the data or the index space, sequence full-width phases
+                                                                   JavaScript over the host’s garbage collector: one function
+instead of forking phases against each other, keep light work
+                                                                   per live definition, constructors as tagged objects; tail
+out of forks.
+                                                                   calls trampoline, forks run in sequence, and a request
+                                                                   returns to the loop as an object carrying its continuation.
+7 The GPU                                                           bend file.bend runs this backend in memory, and a loader
+
+The runtime speaks two device APIs, Metal and CUDA, and            makes a .bend file a module under node and Bun, so a Bend
+the device code is not a port: the binary carries its own source   program is also a JavaScript library.
+text, the build compiles the segments a ! can reach into a
+device program beside the binary (a Metal binary archive           10 Results
+of the pipeline, a CUDA cubin behind a hash of the text),
+                                                                   Table 1 supports three readings. The sequential build runs
+and a launch loads it, or compiles it once when the file is
+                                                                   within 0.8 to 1.5 times the time of its C twin: affinity buys
+missing or stale, so host and device run the same functions
+                                                                   the memory story at no sequential cost. Sixteen threads
+by construction.
+                                                                   give 8.8 to 12.1 times over one: the suite forks equal halves,
+   The span is decided once, before the first dispatch:
+                                                                   and each wave ends together. The GPU is bimodal. Uniform
+ --gpu <size> , else 2 GB on Metal, where a buffer cannot
+                                                                   work reaches 52 to 67 times the sequential build (game
+grow under a running kernel, and the whole card on CUDA,
+                                                                   of life, n-body, mandelbrot, merkle), while divergent and
+whose managed pages fault in on demand. Metal wraps the
+                                                                   skewed work loses to sixteen threads (n-queens, symbolic
+host mapping in one zero-copy buffer at the same addresses.
+A device cannot abort, so failure is a protocol: the first
+BendRT: A Parallel Runtime for CPUs and GPUs                                                                                                5
+
+
+     bench               1 thread   16 threads   GPU      C twin      at Data , so counts are minted only for the types a whole-
+                                                                      program analysis finds shared, in a redirect word beside the
+     tree bitonic sort     6.18 s       0.62 s   0.43 s    5.48 s     node, and the rest of a program compiles to moves, borrows
+     game of life          5.46 s       0.48 s   0.08 s    6.82 s     and frees with no count traffic.
+     k-means               2.26 s       0.26 s   0.18 s    2.03 s
+     mandelbrot            4.78 s       0.40 s   0.08 s    3.79 s     12 Limitations
+     tree matmul           3.50 s       0.31 s   0.22 s    2.89 s     The equal-parts contract is unverified: a skewed program
+                                                                      silently loses its parallelism. The CPU and the GPU never
+     merkle tree           4.30 s       0.39 s   0.08 s    3.48 s
+                                                                      compute together, and a mark is honored only at a sequential
+     n-body                4.89 s       0.43 s   0.08 s    4.99 s     point. A ring holds 1024 tasks (up to 8192 on CUDA), a count
+     n-queens              5.51 s       0.46 s   1.24 s    4.61 s     saturates at 224 , a natural at 248 , a block at depth 31; each
+                                                                      overflow is a numbered fail-stop, not a fallback. The Metal
+     tree radix sort       3.89 s       0.36 s   0.25 s    2.67 s
+                                                                      lane is measured; the CUDA lane is in the source and not
+     raytrace              6.15 s       0.53 s   0.21 s    4.67 s     measured here. The C runtime is unverified: the correctness
+     symbolic regr.        3.31 s       0.29 s   0.54 s    2.22 s     argument is the checksum discipline plus the type system’s
+                                                                      guarantees, and the companion paper’s theorems stop at the
+     terrain               2.81 s       0.25 s   0.13 s    2.19 s
+                                                                      calculus.
+Table 1. The pinned suite, bench/runtime/ : seconds on one Apple
+M4 Max (pin of 2026-08-31, commit 64fc4b7 ) for one thread, sixteen   13 Conclusion
+threads, the integrated GPU through Metal, and the hand-written
+C twin, one C function per Bend definition. Each cell is a warm       BendRT compiles an affine functional language to one C file
+run then a timed run on an idle machine, and every executor must      and runs it unchanged from a single thread to a GPU. Affin­
+print the pinned checksum.                                            ity places the frees, the flat evaluator gives every executor
+                                                                      its unit of work, and the cube forks and drains a fixed grid of
+regression), and the design stance is to report the loss rather       rings without contending. The benchmarks show both sides
+than tune the scheduler toward it.                                    of the bargain: near-C sequential speed and large parallel
+                                                                      wins when the fork contract holds, and honest losses on
+11 Related Work                                                       divergent work.
+Interaction nets. HVM [7, 13] evaluates interaction combina­
+                                                                      References
+tors: optimal sharing and parallelism at every redex. BendRT
+                                                                      [1]  Guy E. Blelloch. 1996. Programming Parallel Algorithms. Communi­
+keeps the goals and drops the mechanism: affinity gives
+                                                                           cations of the ACM 39, 3 (1996), 85–97.
+unique ownership directly, so the graph and its duplication           [2] Robert D. Blumofe and Charles E. Leiserson. 1999. Scheduling Multi­
+machinery become unnecessary. Lost is optimal reduction                    threaded Computations by Work Stealing. Journal of the ACM 46, 5
+of shared redexes; gained are native-speed sequential code,                (1999), 720–748.
+                                                                      [3] Manuel M. T. Chakravarty, Gabriele Keller, Sean Lee, Trevor L. Mc­
+flat memory and a cost model a programmer can read.
+                                                                           Donell, and Vinod Grover. 2011. Accelerating Haskell Array Codes
+   Scheduling. Work stealing [2, 4] is the standard answer to              with Multicore GPUs. In Declarative Aspects of Multicore Program­
+irregular parallelism, and its absence here is the scheduling              ming (DAMP), 2011. ACM, 3–14.
+novelty: the balance obligation moves into the language               [4] Matteo Frigo, Charles E. Leiserson, and Keith H. Randall. 1998. The
+                                                                           Implementation of the Cilk-5 Multithreaded Language. In Program­
+contract and the runtime stays wave-structured [16], which
+                                                                           ming Language Design and Implementation (PLDI), 1998. ACM, 212–
+is what lets one scheduler run on a GPU at all. Lazy                       223.
+task creation [10] anticipates the work phase: a fork met             [5] Robert H. Halstead. 1985. Multilisp: A Language for Concurrent Sym­
+while draining runs as a plain call. GHC’s sparks [8] and                  bolic Computation. ACM Transactions on Programming Languages
+                                                                           and Systems 7, 4 (1985), 501–538.
+Multilisp’s futures [5] are hints like the parallel let, but back
+                                                                      [6] Troels Henriksen, Niels G. W. Serup, Martin Elsman, Fritz Henglein,
+onto stealing pools and a collected heap.                                  and Cosmin E. Oancea. 2017. Futhark: Purely Functional GPU-
+   Functional GPU compilation. Futhark [6], Accelerate [3]                 Programming with Nested Parallelism and In-Place Array Updates.
+and NESL [1] flatten array combinators into kernels. Bend’s                In Programming Language Design and Implementation (PLDI), 2017.
+                                                                           ACM, 556–571.
+unit of GPU execution is the whole language, recursion,
+                                                                      [7] Yves Lafont. 1997. Interaction Combinators. Information and Compu­
+allocation and algebraic data included, run by a scheduler                 tation 137, 1 (1997), 69–101.
+that lives on the device; the price is younger, less specialized      [8] Simon Marlow, Simon Peyton Jones, and Satnam Singh. 2009. Run­
+device code, visible in the losses of Table 1.                             time Support for Multicore Haskell. In International Conference on
+                                                                           Functional Programming (ICFP), 2009. ACM, 65–78.
+   Memory. Regions [14] and linear types [17] aimed at
+                                                                      [9] Nicholas D. Matsakis and Felix S. Klock. 2014. The Rust Language. In
+collector-free functional memory; Rust [9] made ownership                  High Integrity Language Technology (HILT), 2014. ACM, 103–104.
+with static borrows mainstream; Lean [15] and Perceus [11]            [10] Eric Mohr, David A. Kranz, and Robert H. Halstead. 1990. Lazy Task
+count precisely and reuse in place. Bend differs in where                  Creation: A Technique for Increasing the Granularity of Parallel
+                                                                           Programs. In LISP and Functional Programming (LFP), 1990. ACM,
+counts live and when they exist: contraction exists only
+                                                                           185–197.
+6                                                                              Victor Taelin et al.
+
+
+[11] Alex Reinking, Ningning Xie, Leonardo de Moura, and Daan Leijen.
+     2021. Perceus: Garbage Free Reference Counting with Reuse. In Pro­
+     gramming Language Design and Implementation (PLDI), 2021. ACM,
+     96–111.
+[12] Victor Taelin, Lorenzo W Battistela, Paulo J Cavalcanti, Nicolas Abril,
+     Vitor Chiarelli Neves, and Vanessa Ostroski. 2026. BendTT: An Affine
+     Dependent Type Theory.
+[13] Victor Taelin. 2024. HVM2: A Parallel Evaluator for Interaction Com­
+     binators. Retrieved from https://github.com/HigherOrderCO/HVM2/
+     blob/main/paper/HVM2.pdf
+[14] Mads Tofte and Jean-Pierre Talpin. 1997. Region-Based Memory
+     Management. Information and Computation 132, 2 (1997), 109–176.
+[15] Sebastian Ullrich and Leonardo de Moura. 2019. Counting Immutable
+     Beans: Reference Counting Optimized for Purely Functional Pro­
+     gramming. In Implementation and Application of Functional Languages
+     (IFL), 2019. ACM.
+[16] Leslie G. Valiant. 1990. A Bridging Model for Parallel Computation.
+     Communications of the ACM 33, 8 (1990), 103–111.
+[17] Philip Wadler. 1990. Linear Types Can Change the World. In Program­
+     ming Concepts and Methods, 1990. North-Holland, 561–581.
+
